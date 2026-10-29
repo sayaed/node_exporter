@@ -1,0 +1,8 @@
+[monitoring]
+centos7 ansible_host=192.0.2.10 ansible_user=deploy
+
+[node_exporters]
+rhel8_1 ansible_host=192.0.2.11 ansible_user=deploy
+
+[all:vars]
+ansible_become=true

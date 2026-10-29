@@ -1,0 +1,480 @@
+---
+- name: Start the existing Prometheus and deploy monitoring services
+  hosts: monitoring
+  become: true
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Require CentOS 7 for the legacy-compatible package pins
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "CentOS"
+          - ansible_distribution_major_version == "7"
+        fail_msg: This play targets CentOS 7; use a supported distribution for new deployments.
+
+    - name: Check that the existing Prometheus config and promtool are present
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ prometheus_config_file }}"
+        - "{{ prometheus_promtool_path }}"
+      register: prometheus_prerequisites
+
+    - name: Require the existing Prometheus files
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+        fail_msg: Set prometheus_config_file and prometheus_promtool_path to the existing installation paths.
+      loop: "{{ prometheus_prerequisites.results }}"
+
+    - name: Read existing Prometheus config
+      ansible.builtin.slurp:
+        src: "{{ prometheus_config_file }}"
+      register: prometheus_config
+
+    - name: Require an existing scrape_configs section
+      ansible.builtin.assert:
+        that:
+          - (prometheus_config.content | b64decode) is search('(?m)^scrape_configs:')
+        fail_msg: The existing Prometheus config needs a top-level scrape_configs section.
+
+    - name: Validate existing Prometheus config before editing
+      ansible.builtin.command:
+        argv:
+          - "{{ prometheus_promtool_path }}"
+          - check
+          - config
+          - "{{ prometheus_config_file }}"
+      changed_when: false
+
+    - name: Ensure Prometheus discovers node_exporter through Consul
+      ansible.builtin.blockinfile:
+        path: "{{ prometheus_config_file }}"
+        insertafter: "^scrape_configs:"
+        marker: "# {mark} ANSIBLE MANAGED CONSUL NODE EXPORTER JOB"
+        backup: true
+        block: |
+          - job_name: consul-node-exporters
+            consul_sd_configs:
+              - server: 127.0.0.1:8500
+                services:
+                  - node_exporter
+      notify: Restart Prometheus
+
+    - name: Validate Prometheus config after editing
+      ansible.builtin.command:
+        argv:
+          - "{{ prometheus_promtool_path }}"
+          - check
+          - config
+          - "{{ prometheus_config_file }}"
+      changed_when: false
+
+    - name: Install archive extraction utility
+      ansible.builtin.yum:
+        name: unzip
+        state: present
+
+    - name: Create Alertmanager service account
+      ansible.builtin.user:
+        name: alertmanager
+        system: true
+        shell: /sbin/nologin
+        home: /var/lib/alertmanager
+        create_home: false
+
+    - name: Create Alertmanager directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: alertmanager
+        group: alertmanager
+        mode: "0750"
+      loop:
+        - /etc/alertmanager
+        - /var/lib/alertmanager
+
+    - name: Download Alertmanager
+      ansible.builtin.get_url:
+        url: "https://github.com/prometheus/alertmanager/releases/download/v{{ alertmanager_version }}/alertmanager-{{ alertmanager_version }}.linux-amd64.tar.gz"
+        dest: "/tmp/alertmanager-{{ alertmanager_version }}.linux-amd64.tar.gz"
+        mode: "0644"
+
+    - name: Unpack Alertmanager
+      ansible.builtin.unarchive:
+        src: "/tmp/alertmanager-{{ alertmanager_version }}.linux-amd64.tar.gz"
+        dest: /tmp
+        remote_src: true
+        creates: "/tmp/alertmanager-{{ alertmanager_version }}.linux-amd64/alertmanager"
+
+    - name: Install Alertmanager binaries
+      ansible.builtin.copy:
+        src: "/tmp/alertmanager-{{ alertmanager_version }}.linux-amd64/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - alertmanager
+        - amtool
+      notify: Restart Alertmanager
+
+    - name: Install a minimal Alertmanager config if none exists
+      ansible.builtin.copy:
+        dest: /etc/alertmanager/alertmanager.yml
+        owner: alertmanager
+        group: alertmanager
+        mode: "0640"
+        force: false
+        content: |
+          route:
+            receiver: default
+          receivers:
+            - name: default
+      notify: Restart Alertmanager
+
+    - name: Install Alertmanager systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/alertmanager.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Prometheus Alertmanager
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          User=alertmanager
+          Group=alertmanager
+          Type=simple
+          ExecStart=/usr/local/bin/alertmanager --config.file=/etc/alertmanager/alertmanager.yml --storage.path=/var/lib/alertmanager
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart Alertmanager
+
+    - name: Install Grafana RPM
+      ansible.builtin.yum:
+        name: "{{ grafana_rpm_url }}"
+        state: present
+
+    - name: Create Consul service account
+      ansible.builtin.user:
+        name: consul
+        system: true
+        shell: /sbin/nologin
+        home: "{{ consul_data_dir }}"
+        create_home: false
+
+    - name: Create Consul directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: consul
+        group: consul
+        mode: "0750"
+      loop:
+        - "{{ consul_config_dir }}"
+        - "{{ consul_data_dir }}"
+
+    - name: Download Consul
+      ansible.builtin.get_url:
+        url: "https://releases.hashicorp.com/consul/{{ consul_version }}/consul_{{ consul_version }}_linux_amd64.zip"
+        dest: "/tmp/consul_{{ consul_version }}_linux_amd64.zip"
+        checksum: "sha256:{{ consul_sha256 }}"
+        mode: "0644"
+
+    - name: Install Consul binary
+      ansible.builtin.unarchive:
+        src: "/tmp/consul_{{ consul_version }}_linux_amd64.zip"
+        dest: "/tmp/consul-{{ consul_version }}"
+        remote_src: true
+        creates: "/tmp/consul-{{ consul_version }}/consul"
+      notify: Restart Consul
+
+    - name: Copy Consul executable into place
+      ansible.builtin.copy:
+        src: "/tmp/consul-{{ consul_version }}/consul"
+        dest: /usr/local/bin/consul
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      notify: Restart Consul
+
+    - name: Configure single-server Consul agent
+      ansible.builtin.copy:
+        dest: "{{ consul_config_dir }}/consul.hcl"
+        owner: consul
+        group: consul
+        mode: "0640"
+        content: |
+          datacenter = "dc1"
+          data_dir = "{{ consul_data_dir }}"
+          server = true
+          bootstrap_expect = 1
+          bind_addr = "{{ consul_bind_address }}"
+          client_addr = "127.0.0.1"
+          ui_config {
+            enabled = true
+          }
+      notify: Restart Consul
+
+    - name: Install Consul systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/consul.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Consul agent
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          User=consul
+          Group=consul
+          ExecStart=/usr/local/bin/consul agent -config-dir={{ consul_config_dir }}
+          ExecReload=/bin/kill -HUP $MAINPID
+          KillSignal=SIGINT
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart Consul
+
+    - name: Enable and start existing Prometheus
+      ansible.builtin.systemd:
+        name: "{{ prometheus_service_name }}"
+        enabled: true
+        state: started
+
+    - name: Enable and start Alertmanager, Grafana, and Consul
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop:
+        - alertmanager
+        - grafana-server
+        - consul
+
+  handlers:
+    - name: Restart Prometheus
+      ansible.builtin.systemd:
+        name: "{{ prometheus_service_name }}"
+        state: restarted
+
+    - name: Restart Alertmanager
+      ansible.builtin.systemd:
+        name: alertmanager
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart Consul
+      ansible.builtin.systemd:
+        name: consul
+        state: restarted
+        daemon_reload: true
+
+- name: Install node_exporter and Consul client on RHEL8-1
+  hosts: node_exporters
+  become: true
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Require RHEL 8
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "RedHat"
+          - ansible_distribution_major_version == "8"
+        fail_msg: This play targets RHEL 8; adjust the assertion for a compatible derivative.
+
+    - name: Install archive extraction utility
+      ansible.builtin.dnf:
+        name: unzip
+        state: present
+
+    - name: Create node_exporter service account
+      ansible.builtin.user:
+        name: node_exporter
+        system: true
+        shell: /sbin/nologin
+        create_home: false
+
+    - name: Download node_exporter
+      ansible.builtin.get_url:
+        url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        dest: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        mode: "0644"
+
+    - name: Unpack node_exporter
+      ansible.builtin.unarchive:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        dest: /tmp
+        remote_src: true
+        creates: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+
+    - name: Install node_exporter binary
+      ansible.builtin.copy:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+        dest: /usr/local/bin/node_exporter
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      notify: Restart node_exporter
+
+    - name: Install node_exporter systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/node_exporter.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Prometheus Node Exporter
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          User=node_exporter
+          Group=node_exporter
+          Type=simple
+          ExecStart=/usr/local/bin/node_exporter --web.listen-address={{ node_exporter_listen_address }}
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart node_exporter
+
+    - name: Create Consul service account
+      ansible.builtin.user:
+        name: consul
+        system: true
+        shell: /sbin/nologin
+        home: "{{ consul_data_dir }}"
+        create_home: false
+
+    - name: Create Consul directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: consul
+        group: consul
+        mode: "0750"
+      loop:
+        - "{{ consul_config_dir }}"
+        - "{{ consul_data_dir }}"
+
+    - name: Download Consul
+      ansible.builtin.get_url:
+        url: "https://releases.hashicorp.com/consul/{{ consul_version }}/consul_{{ consul_version }}_linux_amd64.zip"
+        dest: "/tmp/consul_{{ consul_version }}_linux_amd64.zip"
+        checksum: "sha256:{{ consul_sha256 }}"
+        mode: "0644"
+
+    - name: Install Consul binary
+      ansible.builtin.unarchive:
+        src: "/tmp/consul_{{ consul_version }}_linux_amd64.zip"
+        dest: "/tmp/consul-{{ consul_version }}"
+        remote_src: true
+        creates: "/tmp/consul-{{ consul_version }}/consul"
+      notify: Restart Consul
+
+    - name: Copy Consul executable into place
+      ansible.builtin.copy:
+        src: "/tmp/consul-{{ consul_version }}/consul"
+        dest: /usr/local/bin/consul
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      notify: Restart Consul
+
+    - name: Configure Consul client agent
+      ansible.builtin.copy:
+        dest: "{{ consul_config_dir }}/consul.hcl"
+        owner: consul
+        group: consul
+        mode: "0640"
+        content: |
+          datacenter = "dc1"
+          data_dir = "{{ consul_data_dir }}"
+          server = false
+          bind_addr = "{{ consul_bind_address }}"
+          client_addr = "127.0.0.1"
+          retry_join = ["{{ consul_server_address }}"]
+      notify: Restart Consul
+
+    - name: Register node_exporter in Consul
+      ansible.builtin.copy:
+        dest: "{{ consul_config_dir }}/node-exporter.json"
+        owner: consul
+        group: consul
+        mode: "0640"
+        content: |
+          {
+            "service": {
+              "name": "node_exporter",
+              "port": 9100,
+              "checks": [{
+                "http": "http://127.0.0.1:9100/metrics",
+                "interval": "30s"
+              }]
+            }
+          }
+      notify: Restart Consul
+
+    - name: Install Consul systemd unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/consul.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Consul agent
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          User=consul
+          Group=consul
+          ExecStart=/usr/local/bin/consul agent -config-dir={{ consul_config_dir }}
+          ExecReload=/bin/kill -HUP $MAINPID
+          KillSignal=SIGINT
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart Consul
+
+    - name: Enable and start node_exporter and Consul
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop:
+        - node_exporter
+        - consul
+
+  handlers:
+    - name: Restart node_exporter
+      ansible.builtin.systemd:
+        name: node_exporter
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart Consul
+      ansible.builtin.systemd:
+        name: consul
+        state: restarted
+        daemon_reload: true

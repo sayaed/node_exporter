@@ -1,0 +1,24 @@
+---
+# Legacy-compatible pins for CentOS 7. These releases are old and no longer
+# receive current upstream security updates.
+alertmanager_version: "0.26.0"
+grafana_version: "9.5.15"
+consul_version: "1.17.3"
+consul_sha256: "bb71f4b9b465e314af0d98f5a6884794be9a44e930180537f0825ae9939461a4"
+node_exporter_version: "1.12.1"
+
+# Existing Prometheus installation: these tasks do not download or replace it.
+prometheus_service_name: prometheus
+prometheus_config_file: /etc/prometheus/prometheus.yml
+prometheus_promtool_path: /usr/local/bin/promtool
+
+monitoring_group: monitoring
+consul_server_address: >-
+  {{ hostvars[groups[monitoring_group][0]].ansible_host
+     | default(hostvars[groups[monitoring_group][0]].ansible_default_ipv4.address) }}
+consul_data_dir: /opt/consul
+consul_config_dir: /etc/consul.d
+consul_bind_address: "{{ ansible_default_ipv4.address }}"
+
+node_exporter_listen_address: "0.0.0.0:9100"
+grafana_rpm_url: "https://dl.grafana.com/oss/release/grafana-{{ grafana_version }}-1.x86_64.rpm"

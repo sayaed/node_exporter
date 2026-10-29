@@ -1,0 +1,194 @@
+// Copyright 2024 The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build freebsd
+
+package collector
+
+import (
+	"testing"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+func testSetup() {
+	sysctlRaw = func(name string, _ ...int) ([]byte, error) {
+		mockData := getFreeBSDDataMock(name)
+		return mockData, nil
+	}
+}
+
+func TestNetStatCollectorDescribe(t *testing.T) {
+	ch := make(chan *prometheus.Desc, 1)
+	collector := &netStatCollector{
+		netStatMetric: prometheus.NewDesc("dummy_metric", "dummy", nil, nil),
+	}
+	collector.Describe(ch)
+	desc := <-ch
+
+	expected := "Desc{fqName: \"dummy_metric\", help: \"dummy\", constLabels: {}, variableLabels: {}}"
+	if want, got := expected, desc.String(); want != got {
+		t.Errorf("want %s, got %s", want, got)
+	}
+}
+
+func TestGetTCPMetrics(t *testing.T) {
+	testSetup()
+
+	tcpData, err := NewTCPStat().GetData()
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	sndTotal := tcpData[tcpSendTotal]
+	rcvTotal := tcpData[tcpRecvTotal]
+
+	if got, want := sndTotal, float64(1234); got != want {
+		t.Errorf("unexpected sndTotal value: want %f, got %f", want, got)
+	}
+
+	if got, want := rcvTotal, float64(4321); got != want {
+		t.Errorf("unexpected rcvTotal value: want %f, got %f", want, got)
+	}
+}
+
+func TestGetTCPStatesMetrics(t *testing.T) {
+	testSetup()
+
+	tcpData, err := getTCPStates()
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	expected := []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+
+	for i, value := range tcpData {
+		if got, want := float64(value), float64(expected[i]); got != want {
+			t.Errorf("unexpected %s value: want %f, got %f", tcpStates[i], want, got)
+		}
+	}
+
+}
+
+func TestGetUDPMetrics(t *testing.T) {
+	testSetup()
+
+	udpData, err := NewUDPStat().GetData()
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	sndTotal := udpData[udpSendTotal]
+	rcvTotal := udpData[udpRecvTotal]
+
+	if got, want := sndTotal, float64(1234); got != want {
+		t.Errorf("unexpected sndTotal value: want %f, got %f", want, got)
+	}
+
+	if got, want := rcvTotal, float64(4321); got != want {
+		t.Errorf("unexpected rcvTotal value: want %f, got %f", want, got)
+	}
+}
+
+func TestGetIPv4Metrics(t *testing.T) {
+	testSetup()
+
+	ipv4Data, err := NewIPv4Stat().GetData()
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	sndTotal := ipv4Data[ipv4SendTotal]
+	rcvTotal := ipv4Data[ipv4RecvTotal]
+	forwardTotal := ipv4Data[ipv4ForwardTotal]
+	deliveredTotal := ipv4Data[ipv4DeliveredTotal]
+
+	if got, want := sndTotal, float64(1234); got != want {
+		t.Errorf("unexpected sndTotal value: want %f, got %f", want, got)
+	}
+
+	if got, want := rcvTotal, float64(1236); got != want {
+		t.Errorf("unexpected rcvTotal value: want %f, got %f", want, got)
+	}
+
+	if got, want := forwardTotal, float64(1238); got != want {
+		t.Errorf("unexpected forwardTotal value: want %f, got %f", want, got)
+	}
+
+	if got, want := deliveredTotal, float64(1240); got != want {
+		t.Errorf("unexpected deliveredTotal value: want %f, got %f", want, got)
+	}
+}
+
+func TestGetIPv6Metrics(t *testing.T) {
+	testSetup()
+
+	ipv6Data, err := NewIPv6Stat().GetData()
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	sndTotal := ipv6Data[ipv6SendTotal]
+	rcvTotal := ipv6Data[ipv6RecvTotal]
+	forwardTotal := ipv6Data[ipv6ForwardTotal]
+	deliveredTotal := ipv6Data[ipv6DeliveredTotal]
+
+	if got, want := sndTotal, float64(1234); got != want {
+		t.Errorf("unexpected sndTotal value: want %f, got %f", want, got)
+	}
+
+	if got, want := rcvTotal, float64(1236); got != want {
+		t.Errorf("unexpected rcvTotal value: want %f, got %f", want, got)
+	}
+
+	if got, want := forwardTotal, float64(1238); got != want {
+		t.Errorf("unexpected forwardTotal value: want %f, got %f", want, got)
+	}
+
+	if got, want := deliveredTotal, float64(1240); got != want {
+		t.Errorf("unexpected deliveredTotal value: want %f, got %f", want, got)
+	}
+}
+
+func TestNetStatCollectorUpdate(t *testing.T) {
+	collector := &netStatCollector{
+		netStatMetric: prometheus.NewDesc("netstat_metric", "NetStat Metric", nil, nil),
+	}
+
+	totalMetrics := len(counterMetrics) + len(tcpStates)
+
+	ch := make(chan prometheus.Metric, totalMetrics)
+
+	err := collector.Update(ch)
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	if got, want := len(ch), totalMetrics; got != want {
+		t.Fatalf("metric count mismatch: want %d, got %d", want, got)
+	}
+
+	for range totalMetrics {
+		<-ch
+	}
+}
+
+func TestNewNetStatCollector(t *testing.T) {
+	collector, err := NewNetStatCollector(nil)
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+	if collector == nil {
+		t.Fatal("collector is nil, want non-nil")
+	}
+}
