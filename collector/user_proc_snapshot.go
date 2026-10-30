@@ -17,6 +17,9 @@
 package collector
 
 import (
+	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -69,12 +72,13 @@ var (
 // userIOReadNeeded is set by NewUserIOCollector, which node_exporter only calls
 // for a collector that is actually enabled.
 //
-// Reading /proc/<pid>/io is the most expensive of the three per-process files:
+// Reading /proc/<pid>/io is the most expensive of the per-process files:
 // it is gated on PTRACE_MODE_READ over the target, so an unprivileged exporter
 // gets EACCES -- and, on a host that logs ptrace denials, an audit record -- for
 // every process it does not own. When the only collector that consumes those
 // counters is not built, reading the file is pure cost.
 var userIOReadNeeded atomic.Bool
+var userMemoryPSSReadNeeded atomic.Bool
 
 // getUserProcSnapshot returns the cached snapshot, rebuilding it once the cached
 // copy is older than userProcSnapshotTTL.
@@ -117,13 +121,13 @@ func buildUserProcSnapshot() (*userProcSnapshot, error) {
 	}, nil
 }
 
-// readUserProcs reads and parses the three per-process files the user_*
-// collectors need between them, and returns one row per process.
+// readUserProcs reads and parses the per-process files the user_* collectors
+// need between them, and returns one row per process. PSS and I/O reads are
+// enabled only when their respective collectors are enabled.
 //
-// Reading the union in a single pass is deliberate: it turns what used to be up
-// to five reads of /proc/<pid>/status plus a second /proc/<pid>/stat read and a
-// readdir of /proc/<pid>/task per PID into one consistent pass, and it
-// guarantees that every collector sees the same values for the same process.
+// Reading the union in a single pass is deliberate: it avoids separate walks
+// for each collector and guarantees that every collector sees the same values
+// for the same process.
 //
 // The walk is the single largest piece of latency on the scrape path for hosts
 // with many processes, so the per-process reads run on a small pool of workers
@@ -148,6 +152,7 @@ func readUserProcs() ([]userProcInfo, error) {
 	refreshUIDNameMap()
 
 	readIO := userIOReadNeeded.Load()
+	readPSS := userMemoryPSSReadNeeded.Load()
 
 	procs := make([]userProcInfo, len(pids))
 
@@ -165,7 +170,7 @@ func readUserProcs() ([]userProcInfo, error) {
 				if i >= len(pids) {
 					return
 				}
-				if info, ok := reader.readProcess(pids[i], readIO); ok {
+				if info, ok := reader.readProcess(pids[i], readIO, readPSS); ok {
 					procs[i] = info
 				}
 			}
@@ -225,8 +230,9 @@ func listProcPIDs() ([]int, error) {
 // files, times every process, on every rebuild. One reader per worker makes the
 // steady state allocation free.
 type procReader struct {
-	body []byte
-	path []byte
+	body        []byte
+	path        []byte
+	smapsReader *bufio.Reader
 }
 
 // processFile returns the path of one file of a process.
@@ -283,6 +289,49 @@ func (r *procReader) readInto(path string) ([]byte, error) {
 	}
 }
 
+// readPSS reads proportional set size. Older kernels without smaps_rollup use
+// smaps, which is larger but exposes the same per-mapping Pss values.
+func (r *procReader) readPSS(pid int) (uint64, bool) {
+	f, err := os.Open(r.processFile(pid, "/smaps_rollup"))
+	if errors.Is(err, os.ErrNotExist) {
+		f, err = os.Open(r.processFile(pid, "/smaps"))
+	}
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+
+	if r.smapsReader == nil {
+		r.smapsReader = bufio.NewReaderSize(f, minProcReadBuf)
+	} else {
+		r.smapsReader.Reset(f)
+	}
+
+	var pssKB uint64
+	var foundPSS bool
+	for {
+		line, readErr := r.smapsReader.ReadSlice('\n')
+		if readErr != bufio.ErrBufferFull {
+			found, valid := addSmapsPSSLine(line, &pssKB)
+			if !valid {
+				return 0, false
+			}
+			foundPSS = foundPSS || found
+		} else if bytes.HasPrefix(line, procKeyPSS) {
+			return 0, false
+		}
+
+		switch readErr {
+		case nil, bufio.ErrBufferFull:
+			continue
+		case io.EOF:
+			return pssKB, foundPSS
+		default:
+			return 0, false
+		}
+	}
+}
+
 // readProcess reads and parses everything the user_* collectors need from one
 // process.
 //
@@ -296,7 +345,7 @@ func (r *procReader) readInto(path string) ([]byte, error) {
 // inside the pool lets that latency overlap with the other workers' file reads
 // instead of stalling the tail of the rebuild -- which runs with the snapshot
 // mutex held, so it would stall every user_* collector of the scrape.
-func (r *procReader) readProcess(pid int, readIO bool) (userProcInfo, bool) {
+func (r *procReader) readProcess(pid int, readIO, readPSS bool) (userProcInfo, bool) {
 	status, err := r.readInto(r.processFile(pid, "/status"))
 	if err != nil {
 		return userProcInfo{}, false
@@ -308,6 +357,10 @@ func (r *procReader) readProcess(pid int, readIO bool) (userProcInfo, bool) {
 	}
 
 	info := userProcInfo{PID: pid, UID: uid, User: lookupUsernameID(uid), RSSKB: rssKB}
+
+	if readPSS {
+		info.PSSKB, info.PSSAvailable = r.readPSS(pid)
+	}
 
 	// stat and io are optional. stat is unreadable only for a process that is
 	// exiting anyway, and io needs PTRACE_MODE_READ on the target.

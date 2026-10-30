@@ -164,6 +164,54 @@ func TestParseStatusUIDAndRSS(t *testing.T) {
 	}
 }
 
+func TestParseSmapsPSS(t *testing.T) {
+	tests := []struct {
+		name    string
+		smaps   string
+		wantPSS uint64
+		wantOK  bool
+	}{
+		{
+			name:    "smaps rollup",
+			smaps:   "Rss: 2048 kB\nPss: 1536 kB\n",
+			wantPSS: 1536,
+			wantOK:  true,
+		},
+		{
+			name:    "sum smaps mappings",
+			smaps:   "00400000-00452000 r-xp 00000000 08:02 123\nPss: 12 kB\n00600000-00652000 rw-p 00000000 08:02 123\nPss: 34 kB\n",
+			wantPSS: 46,
+			wantOK:  true,
+		},
+		{
+			name:   "zero pss",
+			smaps:  "Pss: 0 kB\n",
+			wantOK: true,
+		},
+		{
+			name:  "missing pss",
+			smaps: "Rss: 12 kB\n",
+		},
+		{
+			name:  "malformed pss",
+			smaps: "Pss: unknown kB\n",
+		},
+		{
+			name:  "overflow",
+			smaps: "Pss: 18446744073709551615 kB\nPss: 1 kB\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotPSS, gotOK := parseSmapsPSS([]byte(tt.smaps))
+			if gotPSS != tt.wantPSS || gotOK != tt.wantOK {
+				t.Errorf("parseSmapsPSS() = (%d, %v), want (%d, %v)", gotPSS, gotOK, tt.wantPSS, tt.wantOK)
+			}
+		})
+	}
+}
+
 func TestParseIOBytes(t *testing.T) {
 	tests := []struct {
 		name      string
