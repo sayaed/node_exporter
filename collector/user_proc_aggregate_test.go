@@ -30,29 +30,33 @@ func synthRows(n, users int) []userProcInfo {
 
 	for i := range n {
 		rows = append(rows, userProcInfo{
-			PID:        1000 + i,
-			UID:        uint32(i % users),
-			User:       "acct" + strconv.Itoa(i%users),
-			RSSKB:      uint64(1024 + i%8192),
-			Threads:    1 + i%8,
-			CPUTicks:   uint64(100000 + i*3),
-			Majflt:     uint64(i % 97),
-			ReadBytes:  uint64(1<<20 + i),
-			WriteBytes: uint64(1<<20 + i*7),
+			PID:          1000 + i,
+			UID:          uint32(i % users),
+			User:         "acct" + strconv.Itoa(i%users),
+			RSSKB:        uint64(1024 + i%8192),
+			PSSKB:        uint64(512 + i%4096),
+			PSSAvailable: true,
+			Threads:      1 + i%8,
+			CPUTicks:     uint64(100000 + i*3),
+			Majflt:       uint64(i % 97),
+			ReadBytes:    uint64(1<<20 + i),
+			WriteBytes:   uint64(1<<20 + i*7),
 		})
 	}
 
 	// Per-environment accounts, which is what parseUserEnv is for.
 	for i := range 7 {
 		rows = append(rows, userProcInfo{
-			PID:        9000 + i,
-			User:       "envuser_" + strconv.Itoa(10+i),
-			RSSKB:      4096,
-			Threads:    2,
-			CPUTicks:   77,
-			Majflt:     3,
-			ReadBytes:  2048,
-			WriteBytes: 8192,
+			PID:          9000 + i,
+			User:         "envuser_" + strconv.Itoa(10+i),
+			RSSKB:        4096,
+			PSSKB:        2048,
+			PSSAvailable: true,
+			Threads:      2,
+			CPUTicks:     77,
+			Majflt:       3,
+			ReadBytes:    2048,
+			WriteBytes:   8192,
 		})
 	}
 
@@ -64,6 +68,7 @@ func synthRows(n, users int) []userProcInfo {
 		PID:        999999,
 		User:       "",
 		RSSKB:      512,
+		PSSKB:      256,
 		Threads:    1,
 		CPUTicks:   5,
 		Majflt:     1,
@@ -160,6 +165,18 @@ func TestAggregateUserStatsMatchesTheFourCollectorFolds(t *testing.T) {
 			wantMem := foldMem(rows)
 			wantProc := foldProc(rows)
 			wantIO := foldIO(rows)
+			wantPSS := make(map[string]uint64, len(rows))
+			wantPSSUnavailable := make(map[string]int, len(rows))
+			for _, row := range rows {
+				if row.PID == 0 {
+					continue
+				}
+				if row.PSSAvailable {
+					wantPSS[row.User] += row.PSSKB
+				} else {
+					wantPSSUnavailable[row.User]++
+				}
+			}
 
 			// Every user the collectors used to report has to be present with
 			// the same figures, and no extra user may appear.
@@ -179,6 +196,11 @@ func TestAggregateUserStatsMatchesTheFourCollectorFolds(t *testing.T) {
 				}
 				if agg.rssKB != wantMem[agg.username] {
 					t.Errorf("%s: rssKB %d, fold says %d", agg.username, agg.rssKB, wantMem[agg.username])
+				}
+				if agg.pssKB != wantPSS[agg.username] || agg.pssUnavailableProcs != wantPSSUnavailable[agg.username] {
+					t.Errorf("%s: PSS/unavailable %d/%d, fold says %d/%d",
+						agg.username, agg.pssKB, agg.pssUnavailableProcs,
+						wantPSS[agg.username], wantPSSUnavailable[agg.username])
 				}
 				if agg.procs != wantProc[agg.username][0] || agg.threads != wantProc[agg.username][1] {
 					t.Errorf("%s: procs/threads %d/%d, fold says %d/%d",

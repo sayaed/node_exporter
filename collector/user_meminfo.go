@@ -31,8 +31,10 @@ const (
 var userLabelNames = []string{"username", "env"}
 
 type usermemCollector struct {
-	userDesc *prometheus.Desc
-	logger   *slog.Logger
+	userDesc               *prometheus.Desc
+	userPSSDesc            *prometheus.Desc
+	userPSSUnavailableDesc *prometheus.Desc
+	logger                 *slog.Logger
 }
 
 type userLabels struct {
@@ -40,8 +42,10 @@ type userLabels struct {
 }
 
 type userMemStats struct {
-	labels userLabels
-	size   float64
+	labels                  userLabels
+	size                    float64
+	pssSize                 float64
+	pssUnavailableProcesses float64
 }
 
 func init() {
@@ -49,12 +53,30 @@ func init() {
 }
 
 func NewUserMemCollector(logger *slog.Logger) (Collector, error) {
+	// PSS requires reading smaps data, so only collect it when this collector is
+	// enabled.
 	userDesc := prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, usermemInfoSubsystem, "total"),
-		"Memory used by user in bytes.",
+		"Sum of resident memory (RSS) for processes owned by the user, in bytes. Shared pages are counted for each process.",
 		userLabelNames, nil,
 	)
-	return &usermemCollector{userDesc: userDesc, logger: logger}, nil
+	userPSSDesc := prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, usermemInfoSubsystem, "pss_bytes"),
+		"Sum of proportional set size (PSS) for readable processes owned by the user, in bytes.",
+		userLabelNames, nil,
+	)
+	userPSSUnavailableDesc := prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, usermemInfoSubsystem, "pss_unavailable_processes"),
+		"Number of user-owned processes whose proportional set size could not be read.",
+		userLabelNames, nil,
+	)
+	userMemoryPSSReadNeeded.Store(true)
+	return &usermemCollector{
+		userDesc:               userDesc,
+		userPSSDesc:            userPSSDesc,
+		userPSSUnavailableDesc: userPSSUnavailableDesc,
+		logger:                 logger,
+	}, nil
 }
 
 // Update calls (*meminfoCollector).getMemInfo to get the platform specific
@@ -75,15 +97,24 @@ func (c *usermemCollector) Update(ch chan<- prometheus.Metric) error {
 			c.userDesc, prometheus.GaugeValue,
 			s.size, s.labels.username, s.labels.env,
 		)
+		ch <- prometheus.MustNewConstMetric(
+			c.userPSSDesc, prometheus.GaugeValue,
+			s.pssSize, s.labels.username, s.labels.env,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.userPSSUnavailableDesc, prometheus.GaugeValue,
+			s.pssUnavailableProcesses, s.labels.username, s.labels.env,
+		)
 	}
 	return nil
 }
 
-// GetStats turns the per-user totals of the shared snapshot into byte counts.
+// GetStats turns the per-user RSS and PSS totals of the shared snapshot into
+// byte counts.
 //
-// VmRSS is parsed out of /proc/<pid>/status, and summed per user, once per
-// snapshot: this collector no longer walks the process list, copies a status
-// file per process into a string, or runs a scanner over it.
+// RSS comes from /proc/<pid>/status. PSS comes from smaps_rollup or, on older
+// kernels, smaps. Processes whose PSS cannot be read are counted separately so
+// the PSS total is visibly partial rather than silently treated as complete.
 func (c *usermemCollector) GetStats() ([]userMemStats, error) {
 	snapshot, err := getUserProcSnapshot()
 	if err != nil {
@@ -99,7 +130,9 @@ func (c *usermemCollector) GetStats() ([]userMemStats, error) {
 				username: agg.username,
 				env:      agg.env,
 			},
-			size: float64(agg.rssKB) * 1024, // 转换为字节 (kB -> bytes)
+			size:                    float64(agg.rssKB) * 1024,
+			pssSize:                 float64(agg.pssKB) * 1024,
+			pssUnavailableProcesses: float64(agg.pssUnavailableProcs),
 		})
 	}
 

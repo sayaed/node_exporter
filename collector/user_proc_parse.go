@@ -39,6 +39,7 @@ import "bytes"
 var (
 	procKeyUid        = []byte("Uid:")
 	procKeyVmRSS      = []byte("VmRSS:")
+	procKeyPSS        = []byte("Pss:")
 	procKeyReadBytes  = []byte("read_bytes:")
 	procKeyWriteBytes = []byte("write_bytes:")
 	procKeyCPUSummary = []byte("cpu ")
@@ -172,6 +173,44 @@ func parseStatusUIDAndRSS(status []byte) (uid uint32, rssKB uint64, ok bool) {
 	}
 
 	return uid, rssKB, gotUID
+}
+
+// addSmapsPSSLine adds the Pss value from one /proc/<pid>/smaps line.
+// valid is false only when a Pss line is malformed or the sum overflows.
+func addSmapsPSSLine(line []byte, total *uint64) (found, valid bool) {
+	if !bytes.HasPrefix(line, procKeyPSS) {
+		return false, true
+	}
+
+	token, found := tokenAfterKey(line, procKeyPSS)
+	if !found {
+		return true, false
+	}
+	value, valid := parseUintField(token)
+	if !valid || ^uint64(0)-*total < value {
+		return true, false
+	}
+
+	*total += value
+	return true, true
+}
+
+// parseSmapsPSS returns the sum of all Pss lines in smaps or the single Pss
+// line in smaps_rollup. A missing or malformed Pss value is reported as invalid.
+func parseSmapsPSS(smaps []byte) (pssKB uint64, ok bool) {
+	var foundPSS bool
+	for off := 0; off < len(smaps); {
+		line, next := nextLine(smaps, off)
+		off = next
+
+		found, valid := addSmapsPSSLine(line, &pssKB)
+		if !valid {
+			return 0, false
+		}
+		foundPSS = foundPSS || found
+	}
+
+	return pssKB, foundPSS
 }
 
 // statSample holds the /proc/<pid>/stat fields the user_* collectors consume.
