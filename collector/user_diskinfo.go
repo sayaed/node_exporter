@@ -36,39 +36,21 @@ import (
 const (
 	userdiskInfoSubsystem = "user_use_disk"
 
-	// maxUserdiskWorkers caps how many `du` processes run at once. The actual
-	// fan-out is min(NumCPU, maxUserdiskWorkers, number of home directories),
-	// so a machine with fewer cores gets a proportionally narrower one.
-	//
-	// The cap exists for the top end, not the bottom: du is I/O bound, and
-	// past a few dozen concurrent walks of the same filesystem the extra
-	// processes only deepen the I/O queue for everything else sharing the
-	// disk. 32 keeps a 128-core host from handing the filesystem far more work
-	// than a hundred home directories could ever benefit from.
-	maxUserdiskWorkers = 32
+	// maxUserdiskWorkers caps background directory walks so measuring user
+	// homes does not saturate the filesystem and delay foreground scrapes.
+	maxUserdiskWorkers = 2
 
 	// userdiskRefreshInterval is how often the background pass re-measures the
-	// home directories. Deliberately a constant rather than a flag: nothing
-	// about the metric set depends on it, so it only has to be small enough to
-	// keep cache_age_seconds meaningful.
-	userdiskRefreshInterval = 5 * time.Minute
-
-	// userdiskRefreshTimeout caps one background pass end to end, so a stuck du
-	// cannot leave the refresher looping forever without ever publishing. A
-	// pass that runs out of time is abandoned, and the directories it never
-	// reached keep the values they already had.
-	userdiskRefreshTimeout = 5 * time.Minute
+	// home directories. Disk usage is a slow-changing metric; refreshing less
+	// often limits the cumulative I/O caused by walking large home trees.
+	userdiskRefreshInterval = 15 * time.Minute
 
 	// userdiskStaleAfter is how long one directory may keep its previous
 	// measurement before it stops being reported at all.
 	//
-	// Without it a directory whose du keeps failing -- no permission, or
-	// permanently last in a queue that always runs out of time -- would be
-	// carried forward forever, while cache_age_seconds kept resetting on every
-	// pass and showed nothing wrong. The figure for that user would silently
-	// freeze and no panel would say so. Dropping the series instead turns the
-	// failure into a visible gap. Three intervals covers the worst case of one
-	// aborted pass plus the sleep that follows it.
+	// Without it a directory whose du keeps failing would be carried forward
+	// forever, and the figure for that user would silently freeze. Dropping the
+	// series instead turns the failure into a visible gap.
 	userdiskStaleAfter = 3 * userdiskRefreshInterval
 
 	// userdiskSudoProbeTimeout bounds the one-off `sudo -n du --version` probe.
@@ -245,6 +227,31 @@ func getUserdiskCache() *userdiskCache {
 	return userdiskCacheData
 }
 
+// publishUserdiskDirStat atomically publishes one completed directory scan
+// without exposing a map that a concurrent scrape could observe being mutated.
+func publishUserdiskDirStat(path string, stat userdiskDirStat) {
+	userdiskCacheMu.Lock()
+	defer userdiskCacheMu.Unlock()
+
+	userdiskCacheData = userdiskCacheWithStat(userdiskCacheData, path, stat)
+}
+
+func userdiskCacheWithStat(cache *userdiskCache, path string, stat userdiskDirStat) *userdiskCache {
+	var next userdiskCache
+	if cache != nil {
+		next = *cache
+		next.sizes = make(map[string]userdiskDirStat, len(cache.sizes)+1)
+		for cachedPath, cachedStat := range cache.sizes {
+			next.sizes[cachedPath] = cachedStat
+		}
+	} else {
+		next.sizes = make(map[string]userdiskDirStat, 1)
+		next.taken = stat.taken
+	}
+	next.sizes[path] = stat
+	return &next
+}
+
 // measureUserdiskSizes runs one full pass over every home directory.
 func measureUserdiskSizes(logger *slog.Logger) (*userdiskCache, error) {
 	started := time.Now()
@@ -272,18 +279,15 @@ func measureUserdiskSizes(logger *slog.Logger) (*userdiskCache, error) {
 		paths = append(paths, l.pwd)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), userdiskRefreshTimeout)
-	defer cancel()
+	ctx := context.Background()
 
 	sizes := make(map[string]userdiskDirStat, len(paths))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
 	// Scale with the core count up to the cap, and never start more workers
-	// than there are directories to measure. Core count is a weak signal --
-	// du is I/O bound, so it bounds the bookkeeping cost rather than what the
-	// filesystem can serve -- but it is the only signal available without
-	// measuring a pass first, and the cap keeps it from doing harm.
+	// than there are directories to measure. The low cap is deliberate: du is
+	// I/O bound, and excessive concurrent walks can delay foreground scrapes.
 	workers := min(max(runtime.NumCPU(), 1), maxUserdiskWorkers, len(paths))
 
 	jobs := make(chan string)
@@ -297,25 +301,20 @@ func measureUserdiskSizes(logger *slog.Logger) (*userdiskCache, error) {
 					continue
 				}
 				measured := time.Now()
+				stat := userdiskDirStat{size: size, taken: measured}
 				mu.Lock()
-				sizes[path] = userdiskDirStat{size: size, taken: measured}
+				sizes[path] = stat
 				mu.Unlock()
+				publishUserdiskDirStat(path, stat)
 			}
 		})
 	}
 
-	// Feed the workers until every directory is queued or the pass runs out of
-	// time. Whatever is not reached keeps its previous value below, so a
-	// degraded pass costs freshness instead of making metrics disappear.
-feed:
-	for i, path := range paths {
-		select {
-		case jobs <- path:
-		case <-ctx.Done():
-			logger.Warn("Home directory measurement hit its timeout, keeping previous values for the rest",
-				"timeout", userdiskRefreshTimeout, "queued", i, "total", len(paths))
-			break feed
-		}
+	// A full tree walk can legitimately take longer than a scrape or a fixed
+	// pass deadline. Keep it in the background, and publish each completed home
+	// independently so a large directory does not hold up other users' data.
+	for _, path := range paths {
+		jobs <- path
 	}
 	close(jobs)
 	wg.Wait()
@@ -399,8 +398,8 @@ func userdiskDirectorySize(ctx context.Context, path string) (int64, error) {
 // du is the one way to total a home directory whose contents the exporter may
 // not be able to read itself when it runs unprivileged, which is the normal
 // case. It is reached exclusively from the background refresher above -- never
-// from a scrape -- and always through a context with a hard timeout, so it
-// cannot stall /metrics.
+// from a scrape. Directory walks have no fixed timeout because large trees can
+// legitimately take a long time; scrapes use the last published cache instead.
 func userdiskRun(ctx context.Context, argv ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 
