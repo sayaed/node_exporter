@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -28,12 +29,19 @@ const (
 	usermemInfoSubsystem = "user_use_memory"
 )
 
+var userMemoryPSSEnabled = kingpin.Flag(
+	"collector.usermeminfo.pss",
+	"Collect per-user proportional set size (PSS) by reading process smaps data in the background.",
+).Default("false").Bool()
+
 var userLabelNames = []string{"username", "env"}
 
 type usermemCollector struct {
 	userDesc               *prometheus.Desc
 	userPSSDesc            *prometheus.Desc
 	userPSSUnavailableDesc *prometheus.Desc
+	userPSSCacheAgeDesc    *prometheus.Desc
+	collectPSS             bool
 	logger                 *slog.Logger
 }
 
@@ -42,10 +50,8 @@ type userLabels struct {
 }
 
 type userMemStats struct {
-	labels                  userLabels
-	size                    float64
-	pssSize                 float64
-	pssUnavailableProcesses float64
+	labels userLabels
+	size   float64
 }
 
 func init() {
@@ -53,8 +59,15 @@ func init() {
 }
 
 func NewUserMemCollector(logger *slog.Logger) (Collector, error) {
-	// PSS requires reading smaps data, so only collect it when this collector is
-	// enabled.
+	collectPSS := *userMemoryPSSEnabled
+	collector := newUserMemCollector(logger, collectPSS)
+	if collectPSS {
+		startUserPSSRefresher(logger)
+	}
+	return collector, nil
+}
+
+func newUserMemCollector(logger *slog.Logger, collectPSS bool) *usermemCollector {
 	userDesc := prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, usermemInfoSubsystem, "total"),
 		"Sum of resident memory (RSS) for processes owned by the user, in bytes. Shared pages are counted for each process.",
@@ -70,13 +83,20 @@ func NewUserMemCollector(logger *slog.Logger) (Collector, error) {
 		"Number of user-owned processes whose proportional set size could not be read.",
 		userLabelNames, nil,
 	)
-	userMemoryPSSReadNeeded.Store(true)
-	return &usermemCollector{
+	userPSSCacheAgeDesc := prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, usermemInfoSubsystem, "pss_cache_age_seconds"),
+		"Age of the latest completed background per-user PSS measurement, in seconds.",
+		nil, nil,
+	)
+	collector := &usermemCollector{
 		userDesc:               userDesc,
 		userPSSDesc:            userPSSDesc,
 		userPSSUnavailableDesc: userPSSUnavailableDesc,
+		userPSSCacheAgeDesc:    userPSSCacheAgeDesc,
+		collectPSS:             collectPSS,
 		logger:                 logger,
-	}, nil
+	}
+	return collector
 }
 
 // Update calls (*meminfoCollector).getMemInfo to get the platform specific
@@ -97,24 +117,32 @@ func (c *usermemCollector) Update(ch chan<- prometheus.Metric) error {
 			c.userDesc, prometheus.GaugeValue,
 			s.size, s.labels.username, s.labels.env,
 		)
-		ch <- prometheus.MustNewConstMetric(
-			c.userPSSDesc, prometheus.GaugeValue,
-			s.pssSize, s.labels.username, s.labels.env,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			c.userPSSUnavailableDesc, prometheus.GaugeValue,
-			s.pssUnavailableProcesses, s.labels.username, s.labels.env,
-		)
+	}
+	if c.collectPSS {
+		if snapshot := getUserPSSSnapshot(); snapshot != nil {
+			for _, s := range snapshot.users {
+				ch <- prometheus.MustNewConstMetric(
+					c.userPSSDesc, prometheus.GaugeValue,
+					float64(s.pssKB)*1024, s.username, s.env,
+				)
+				ch <- prometheus.MustNewConstMetric(
+					c.userPSSUnavailableDesc, prometheus.GaugeValue,
+					float64(s.unavailableProcs), s.username, s.env,
+				)
+			}
+			ch <- prometheus.MustNewConstMetric(
+				c.userPSSCacheAgeDesc, prometheus.GaugeValue,
+				time.Since(snapshot.taken).Seconds(),
+			)
+		}
 	}
 	return nil
 }
 
-// GetStats turns the per-user RSS and PSS totals of the shared snapshot into
-// byte counts.
+// GetStats turns the per-user RSS totals of the shared snapshot into byte counts.
 //
-// RSS comes from /proc/<pid>/status. PSS comes from smaps_rollup or, on older
-// kernels, smaps. Processes whose PSS cannot be read are counted separately so
-// the PSS total is visibly partial rather than silently treated as complete.
+// RSS comes from /proc/<pid>/status. PSS is collected asynchronously by the
+// background refresher so reading smaps does not block user collectors.
 func (c *usermemCollector) GetStats() ([]userMemStats, error) {
 	snapshot, err := getUserProcSnapshot()
 	if err != nil {
@@ -130,9 +158,7 @@ func (c *usermemCollector) GetStats() ([]userMemStats, error) {
 				username: agg.username,
 				env:      agg.env,
 			},
-			size:                    float64(agg.rssKB) * 1024,
-			pssSize:                 float64(agg.pssKB) * 1024,
-			pssUnavailableProcesses: float64(agg.pssUnavailableProcs),
+			size: float64(agg.rssKB) * 1024,
 		})
 	}
 

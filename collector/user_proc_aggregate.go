@@ -27,24 +27,22 @@ import (
 	"strings"
 )
 
-// userProcInfo is everything the user_* collectors need to know about a single
-// process, already parsed.
+// userProcInfo is the per-process data shared by the user_* collectors, already
+// parsed.
 //
-// The raw /proc/<pid>/{stat,status,io,smaps} byte slices are deliberately not
+// The raw /proc/<pid>/{stat,status,io} byte slices are deliberately not
 // kept. Together they can be large per process; retaining only parsed numbers
-// keeps the snapshot compact even when PSS is collected.
+// keeps the snapshot compact. PSS is refreshed separately in the background.
 type userProcInfo struct {
-	PID          int
-	UID          uint32
-	User         string
-	RSSKB        uint64 // VmRSS from status, in kibibytes
-	PSSKB        uint64 // Proportional set size, in kibibytes
-	PSSAvailable bool   // Whether PSS was read and parsed successfully
-	Threads      int    // num_threads, field 20 of stat
-	CPUTicks     uint64 // utime + stime, fields 14 and 15 of stat
-	Majflt       uint64 // major page faults, field 12 of stat
-	ReadBytes    uint64 // read_bytes of io
-	WriteBytes   uint64 // write_bytes of io
+	PID        int
+	UID        uint32
+	User       string
+	RSSKB      uint64 // VmRSS from status, in kibibytes
+	Threads    int    // num_threads, field 20 of stat
+	CPUTicks   uint64 // utime + stime, fields 14 and 15 of stat
+	Majflt     uint64 // major page faults, field 12 of stat
+	ReadBytes  uint64 // read_bytes of io
+	WriteBytes uint64 // write_bytes of io
 }
 
 // userAgg is one user's totals, summed over every process it owns.
@@ -66,11 +64,9 @@ type userAgg struct {
 	// parseUserEnv once per user to get the same answer.
 	env string
 
-	procs               int
-	threads             int
-	rssKB               uint64
-	pssKB               uint64
-	pssUnavailableProcs int
+	procs   int
+	threads int
+	rssKB   uint64
 
 	// cpuTicks is utime + stime, in clock ticks (USER_HZ), the same unit as the
 	// system total in /proc/stat.
@@ -158,11 +154,6 @@ func aggregateUserStats(procs []userProcInfo) []userAgg {
 		}
 
 		a.rssKB += p.RSSKB
-		if p.PSSAvailable {
-			a.pssKB += p.PSSKB
-		} else {
-			a.pssUnavailableProcs++
-		}
 		a.cpuTicks += p.CPUTicks
 		a.majflt += p.Majflt
 		a.readBytes += p.ReadBytes

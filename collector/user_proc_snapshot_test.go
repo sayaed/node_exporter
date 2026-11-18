@@ -34,11 +34,8 @@ func TestBuildUserProcSnapshotAgainstRealProc(t *testing.T) {
 	// built, so turn that on for the duration of this test to cover that path
 	// as well.
 	restoreIO := userIOReadNeeded.Load()
-	restorePSS := userMemoryPSSReadNeeded.Load()
 	userIOReadNeeded.Store(true)
-	userMemoryPSSReadNeeded.Store(true)
 	t.Cleanup(func() { userIOReadNeeded.Store(restoreIO) })
-	t.Cleanup(func() { userMemoryPSSReadNeeded.Store(restorePSS) })
 
 	procs, err := readUserProcs()
 	if err != nil {
@@ -58,7 +55,7 @@ func TestBuildUserProcSnapshotAgainstRealProc(t *testing.T) {
 
 	own := os.Getpid()
 	var foundSelf bool
-	var withRSS, withPSS, withThreads int
+	var withRSS, withThreads int
 
 	for _, proc := range readable {
 		if proc.PID <= 0 {
@@ -70,9 +67,6 @@ func TestBuildUserProcSnapshotAgainstRealProc(t *testing.T) {
 
 		if proc.RSSKB > 0 {
 			withRSS++
-		}
-		if proc.PSSAvailable && proc.PSSKB > 0 {
-			withPSS++
 		}
 		if proc.Threads > 0 {
 			withThreads++
@@ -86,14 +80,16 @@ func TestBuildUserProcSnapshotAgainstRealProc(t *testing.T) {
 		if proc.RSSKB == 0 {
 			t.Errorf("the test process (pid %d) reports 0 KiB of resident memory", own)
 		}
-		if proc.PSSAvailable && proc.PSSKB == 0 {
-			t.Errorf("the test process (pid %d) reports 0 KiB of proportional memory", own)
-		}
 		if proc.Threads == 0 {
 			t.Errorf("the test process (pid %d) reports 0 threads", own)
 		}
 		if proc.CPUTicks == 0 {
 			t.Errorf("the test process (pid %d) reports 0 CPU ticks", own)
+		}
+
+		var reader procReader
+		if pssKB, available := reader.readPSS(own); available && pssKB == 0 {
+			t.Errorf("the test process (pid %d) reports 0 KiB of proportional memory", own)
 		}
 	}
 
@@ -102,9 +98,6 @@ func TestBuildUserProcSnapshotAgainstRealProc(t *testing.T) {
 	}
 	if withRSS == 0 {
 		t.Error("no process in the snapshot reports any resident memory")
-	}
-	if withPSS == 0 {
-		t.Error("no process in the snapshot reports readable proportional memory")
 	}
 	if withThreads == 0 {
 		t.Error("no process in the snapshot reports any threads")
@@ -200,23 +193,6 @@ func TestUserIOReadNeededSkipsTheIOFile(t *testing.T) {
 	for _, proc := range procs {
 		if proc.ReadBytes != 0 || proc.WriteBytes != 0 {
 			t.Fatalf("pid %d reports io counters even though userio is not built", proc.PID)
-		}
-	}
-}
-
-func TestUserPSSReadNeededSkipsSmaps(t *testing.T) {
-	restore := userMemoryPSSReadNeeded.Load()
-	userMemoryPSSReadNeeded.Store(false)
-	t.Cleanup(func() { userMemoryPSSReadNeeded.Store(restore) })
-
-	procs, err := readUserProcs()
-	if err != nil {
-		t.Fatalf("readUserProcs: %v", err)
-	}
-
-	for _, proc := range procs {
-		if proc.PSSAvailable {
-			t.Fatalf("pid %d reports PSS even though the usermeminfo collector is disabled", proc.PID)
 		}
 	}
 }

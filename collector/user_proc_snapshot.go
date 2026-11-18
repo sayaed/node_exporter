@@ -78,7 +78,6 @@ var (
 // every process it does not own. When the only collector that consumes those
 // counters is not built, reading the file is pure cost.
 var userIOReadNeeded atomic.Bool
-var userMemoryPSSReadNeeded atomic.Bool
 
 // getUserProcSnapshot returns the cached snapshot, rebuilding it once the cached
 // copy is older than userProcSnapshotTTL.
@@ -121,9 +120,9 @@ func buildUserProcSnapshot() (*userProcSnapshot, error) {
 	}, nil
 }
 
-// readUserProcs reads and parses the per-process files the user_* collectors
-// need between them, and returns one row per process. PSS and I/O reads are
-// enabled only when their respective collectors are enabled.
+// readUserProcs reads and parses the per-process files shared by the user_*
+// collectors and returns one row per process. PSS is read separately in the
+// background; I/O reads are enabled only when userio is enabled.
 //
 // Reading the union in a single pass is deliberate: it avoids separate walks
 // for each collector and guarantees that every collector sees the same values
@@ -152,8 +151,6 @@ func readUserProcs() ([]userProcInfo, error) {
 	refreshUIDNameMap()
 
 	readIO := userIOReadNeeded.Load()
-	readPSS := userMemoryPSSReadNeeded.Load()
-
 	procs := make([]userProcInfo, len(pids))
 
 	var next atomic.Int64
@@ -170,7 +167,7 @@ func readUserProcs() ([]userProcInfo, error) {
 				if i >= len(pids) {
 					return
 				}
-				if info, ok := reader.readProcess(pids[i], readIO, readPSS); ok {
+				if info, ok := reader.readProcess(pids[i], readIO); ok {
 					procs[i] = info
 				}
 			}
@@ -345,7 +342,7 @@ func (r *procReader) readPSS(pid int) (uint64, bool) {
 // inside the pool lets that latency overlap with the other workers' file reads
 // instead of stalling the tail of the rebuild -- which runs with the snapshot
 // mutex held, so it would stall every user_* collector of the scrape.
-func (r *procReader) readProcess(pid int, readIO, readPSS bool) (userProcInfo, bool) {
+func (r *procReader) readProcess(pid int, readIO bool) (userProcInfo, bool) {
 	status, err := r.readInto(r.processFile(pid, "/status"))
 	if err != nil {
 		return userProcInfo{}, false
@@ -357,10 +354,6 @@ func (r *procReader) readProcess(pid int, readIO, readPSS bool) (userProcInfo, b
 	}
 
 	info := userProcInfo{PID: pid, UID: uid, User: lookupUsernameID(uid), RSSKB: rssKB}
-
-	if readPSS {
-		info.PSSKB, info.PSSAvailable = r.readPSS(pid)
-	}
 
 	// stat and io are optional. stat is unreadable only for a process that is
 	// exiting anyway, and io needs PTRACE_MODE_READ on the target.

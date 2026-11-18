@@ -168,6 +168,7 @@ time | Exposes the current system time. | _any_
 timex | Exposes selected adjtimex(2) system call stats. | Linux
 udp_queues | Exposes UDP total lengths of the rx_queue and tx_queue from `/proc/net/udp` and `/proc/net/udp6`. | Linux
 uname | Exposes system information as provided by the uname system call. | Darwin, FreeBSD, Linux, OpenBSD
+usermeminfo | Exposes per-user resident memory (RSS). Optional PSS collection reads process smaps data in the background; enable it with `--collector.usermeminfo.pss`. PSS is served from the latest completed scan, with a one-minute delay between scans; `node_user_use_memory_pss_cache_age_seconds` reports its age. | Linux
 vmstat | Exposes statistics from `/proc/vmstat`. | Linux
 watchdog | Exposes statistics from `/sys/class/watchdog` | Linux
 xfs | Exposes XFS runtime statistics. | Linux (kernel 4.4+)
