@@ -22,23 +22,45 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/alecthomas/kingpin/v2"
+)
+
+var (
+	// userProcRefreshInterval paces the background walk that keeps the shared
+	// user_* snapshot warm. Scrapes themselves only read the cached snapshot
+	// and never walk /proc, so the freshness of every user_* metric is bounded
+	// by this value: set it to the scrape interval of the jobs that collect
+	// the user_* metrics.
+	userProcRefreshInterval = kingpin.Flag(
+		"collector.userproc.refresh-interval",
+		"How often the background walk of /proc rebuilds the shared user_* snapshot. Scrapes only read the cached snapshot.",
+	).Default("30s").Duration()
+
+	// userProcWalkBudget bounds one walk.
+	//
+	// Under a memory-reclaim or swap-in storm -- the minutes right after a
+	// memory stress test ends -- every /proc/<pid>/status read contends for
+	// the target's mmap_lock with the kernel's reclaim work and can slow down
+	// by orders of magnitude. A walk that runs out of budget stops where it
+	// is and returns the rows it has: the snapshot is partial, but the
+	// scrape is not, and the next background walk gets a fresh budget.
+	userProcWalkBudget = kingpin.Flag(
+		"collector.userproc.walk-budget",
+		"Max wall time for one /proc walk; an over-budget walk returns partial data rather than blocking scrapes.",
+	).Default("4s").Duration()
+
+	userProcRefreshOnce sync.Once
 )
 
 const (
-	// userProcSnapshotTTL bounds how long a single walk of /proc is reused.
-	//
-	// It has to be short enough that a normal scrape still sees fresh data, but
-	// long enough to cover the spread between the user_* collectors of one
-	// scrape. Those collectors run concurrently, so without this cache each of
-	// them walks /proc and resolves every UID on its own.
-	userProcSnapshotTTL = 2 * time.Second
-
 	// maxUserProcSnapshotWorkers caps the fan-out of the walk. The actual
 	// number of readers is min(NumCPU, this, number of processes), so a small
 	// host uses proportionally fewer and a 128-core host does not start 128 of
@@ -58,15 +80,51 @@ const (
 // total, and the walk visits each process exactly once, so folding there is
 // both cheaper than four separate folds in the collectors and enough to let the
 // rows go. Keeping them would pin another 88 bytes per process -- 440 KiB at
-// 5000 processes -- for the whole TTL, for no reader.
+// 5000 processes -- for the whole lifetime of the snapshot, for no reader.
 type userProcSnapshot struct {
-	taken time.Time
-	users []userAgg
+	taken    time.Time
+	duration time.Duration
+	partial  bool
+	users    []userAgg
+
+	// procs is the number of rows the walk actually read. It backs
+	// node_user_use_memory_snapshot_processes, which turns "the snapshot is
+	// getting thin" -- a budget that keeps running out on a busy host -- into
+	// something a dashboard can show next to the age.
+	procs int
+
+	// rssByPID indexes each measured process's RSS for the PSS refresher,
+	// which skips the smaps read of processes too small to be worth it.
+	//
+	// It is built only when PSS is enabled (userPSSNeedsRSSHint): nothing
+	// else consumes it, and at 50k processes it would otherwise pin about
+	// 2.5 MB per snapshot for no reader. A parallel pair of slices would be
+	// tighter still, but the map keeps the refresher's lookup one line.
+	rssByPID map[int]uint64
 }
 
 var (
-	userProcSnapshotMu   sync.Mutex
+	// userPSSNeedsRSSHint is set by NewUserMemCollector when the PSS
+	// refresher is enabled. It lives here, rather than user_meminfo.go's
+	// kingpin flag being read directly, because this file builds under plain
+	// "linux" while that flag exists only without the nousermeminfo tag.
+	userPSSNeedsRSSHint atomic.Bool
+
+	userProcSnapshotMu   sync.RWMutex
 	userProcSnapshotData *userProcSnapshot
+
+	// userProcBuildMu serialises the cold start: the very first scrape after
+	// process start may find no snapshot yet, and the collectors of that
+	// scrape -- seven of them, running concurrently -- must not each build
+	// their own. It is never held by the background refresher.
+	userProcBuildMu sync.Mutex
+
+	// userProcWalksTotal and userProcPartialTotal back the health metrics of
+	// the same names: a partial count that climbs during incidents is the
+	// budget doing its job, one that climbs while the host is idle means the
+	// budget is set too low.
+	userProcWalksTotal   atomic.Int64
+	userProcPartialTotal atomic.Int64
 )
 
 // userIOReadNeeded is set by NewUserIOCollector, which node_exporter only calls
@@ -79,45 +137,134 @@ var (
 // counters is not built, reading the file is pure cost.
 var userIOReadNeeded atomic.Bool
 
-// getUserProcSnapshot returns the cached snapshot, rebuilding it once the cached
-// copy is older than userProcSnapshotTTL.
+// getUserProcSnapshot returns the latest snapshot the background refresher
+// produced.
 //
-// The rebuild happens while holding the mutex on purpose: the collectors of one
-// scrape call this concurrently, so the first caller walks /proc while the rest
-// block briefly and then share the same result.
+// The read path is a lock-and-return: a scrape never walks /proc. That is the
+// whole point of the design. The old behaviour rebuilt the snapshot on the
+// scrape path whenever the cached copy was more than two seconds old, holding
+// the mutex across the whole walk -- so one slow walk queued every collector of
+// every scrape behind it, and after a memory stress test each queued scrape
+// started yet another walk of its own. Prometheus cancels the HTTP request on
+// timeout, but the Collect goroutines keep running, so the queue kept growing
+// until the machine's reclaim storm subsided.
+//
+// Freshness is bounded by the refresh interval instead: data is at most one
+// interval + one walk duration old, which is what the user_* metrics' scrape
+// interval makes relevant anyway.
+//
+// The one synchronous path left is the cold start: before the background
+// refresher has finished its first walk there is nothing to serve, so the first
+// caller builds once here, under the walk budget. On a started exporter this
+// never happens; in tests and on the very first requests it keeps the response
+// complete instead of empty.
 func getUserProcSnapshot() (*userProcSnapshot, error) {
-	userProcSnapshotMu.Lock()
-	defer userProcSnapshotMu.Unlock()
-
-	if s := userProcSnapshotData; s != nil && time.Since(s.taken) < userProcSnapshotTTL {
+	userProcSnapshotMu.RLock()
+	s := userProcSnapshotData
+	userProcSnapshotMu.RUnlock()
+	if s != nil {
 		return s, nil
 	}
 
-	snapshot, err := buildUserProcSnapshot()
+	userProcBuildMu.Lock()
+	defer userProcBuildMu.Unlock()
+
+	// The cold-start builder may have finished while this caller waited.
+	userProcSnapshotMu.RLock()
+	s = userProcSnapshotData
+	userProcSnapshotMu.RUnlock()
+	if s != nil {
+		return s, nil
+	}
+
+	snapshot, err := buildUserProcSnapshot(*userProcWalkBudget)
 	if err != nil {
-		// Degrade to the previous snapshot rather than failing the scrape.
-		if userProcSnapshotData != nil {
-			return userProcSnapshotData, nil
-		}
 		return nil, err
 	}
 
+	userProcSnapshotMu.Lock()
 	userProcSnapshotData = snapshot
+	userProcSnapshotMu.Unlock()
 	return snapshot, nil
 }
 
+// latestUserProcSnapshot returns the cached snapshot without ever building one.
+//
+// The PSS refresher reads this to get its RSS hint, and it must not be able to
+// trigger a walk: the background loops feed each other, never the other way
+// around, or a slow walk would ask for another.
+func latestUserProcSnapshot() *userProcSnapshot {
+	userProcSnapshotMu.RLock()
+	defer userProcSnapshotMu.RUnlock()
+	return userProcSnapshotData
+}
+
+// startUserProcRefresher launches the background walk that keeps the shared
+// snapshot warm. Every user_* collector constructor calls it, so enabling any
+// one of them starts the walk; the constructor path is what tests bypass to
+// stay deterministic.
+func startUserProcRefresher() {
+	userProcRefreshOnce.Do(func() {
+		go func() {
+			logger := slog.Default()
+			for {
+				snapshot, err := buildUserProcSnapshot(*userProcWalkBudget)
+				if err != nil {
+					logger.Error("Background /proc walk for the user_* snapshot failed, keeping previous values", "error", err)
+				} else {
+					userProcSnapshotMu.Lock()
+					userProcSnapshotData = snapshot
+					userProcSnapshotMu.Unlock()
+
+					logger.Debug("Background /proc walk completed",
+						"processes", snapshot.procs,
+						"partial", snapshot.partial,
+						"duration", snapshot.duration)
+				}
+				time.Sleep(*userProcRefreshInterval)
+			}
+		}()
+	})
+}
+
 // buildUserProcSnapshot walks /proc once and folds what it finds into per-user
-// totals.
-func buildUserProcSnapshot() (*userProcSnapshot, error) {
-	procs, err := readUserProcs()
+// totals. budget bounds the walk; a walk that exceeds it reports partial=true
+// and carries only the rows that made it in time.
+func buildUserProcSnapshot(budget time.Duration) (*userProcSnapshot, error) {
+	started := time.Now()
+	procs, partial, err := readUserProcs(started.Add(budget))
 	if err != nil {
 		return nil, err
 	}
 
-	return &userProcSnapshot{
-		taken: time.Now(),
-		users: aggregateUserStats(procs),
-	}, nil
+	if partial {
+		userProcPartialTotal.Add(1)
+	}
+	userProcWalksTotal.Add(1)
+
+	snapshot := &userProcSnapshot{
+		taken:    time.Now(),
+		duration: time.Since(started),
+		partial:  partial,
+		users:    aggregateUserStats(procs),
+	}
+
+	var readable int
+	for i := range procs {
+		if procs[i].PID == 0 {
+			continue
+		}
+		readable++
+		if userPSSNeedsRSSHint.Load() {
+			if snapshot.rssByPID == nil {
+				snapshot.rssByPID = make(map[int]uint64, readable)
+			}
+			snapshot.rssByPID[procs[i].PID] = procs[i].RSSKB
+		}
+	}
+	snapshot.procs = readable
+
+	return snapshot, nil
 }
 
 // readUserProcs reads and parses the per-process files shared by the user_*
@@ -128,19 +275,25 @@ func buildUserProcSnapshot() (*userProcSnapshot, error) {
 // for each collector and guarantees that every collector sees the same values
 // for the same process.
 //
-// The walk is the single largest piece of latency on the scrape path for hosts
-// with many processes, so the per-process reads run on a small pool of workers
-// instead of one after another. Each worker writes to its own index, so the
-// rows still come out in /proc order and the result is deterministic.
+// The walk used to be the single largest piece of latency on the scrape path
+// for hosts with many processes; it now runs in the background, and this
+// function is called only from there and from the cold start in
+// getUserProcSnapshot. The per-process reads still run on a small pool of
+// workers instead of one after another, and the deadline stops the walk in
+// place when the machine is too slow to finish it: partial data beats a
+// timeout. Each worker writes to its own index, so the rows still come out in
+// /proc order and the result is deterministic.
 //
 // A process that disappeared mid-walk, or whose status file could not be read,
 // leaves its slot zeroed: the returned slice is the full length of the PID list,
 // and a caller must skip entries whose PID is zero. A real process always has a
 // PID above zero, because listProcPIDs never yields pid 0.
-func readUserProcs() ([]userProcInfo, error) {
+//
+// The second return value reports whether the deadline cut the walk short.
+func readUserProcs(deadline time.Time) ([]userProcInfo, bool, error) {
 	pids, err := listProcPIDs()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// Merge /etc/passwd before the workers start, so that the common case --
@@ -155,6 +308,7 @@ func readUserProcs() ([]userProcInfo, error) {
 
 	var next atomic.Int64
 	var wg sync.WaitGroup
+	var partial atomic.Bool
 
 	workers := min(max(runtime.NumCPU(), 1), maxUserProcSnapshotWorkers, len(pids))
 	for range workers {
@@ -167,6 +321,13 @@ func readUserProcs() ([]userProcInfo, error) {
 				if i >= len(pids) {
 					return
 				}
+				// The deadline is checked per pid rather than per read: a
+				// time.Now call costs nanoseconds, and a read that has
+				// already started is cheap to let finish.
+				if time.Now().After(deadline) {
+					partial.Store(true)
+					return
+				}
 				if info, ok := reader.readProcess(pids[i], readIO); ok {
 					procs[i] = info
 				}
@@ -175,7 +336,7 @@ func readUserProcs() ([]userProcInfo, error) {
 	}
 	wg.Wait()
 
-	return procs, nil
+	return procs, partial.Load(), nil
 }
 
 // listProcPIDs returns the numeric process IDs under /proc.

@@ -58,6 +58,10 @@ func NewUserIOCollector(logger *slog.Logger) (Collector, error) {
 	// reading. See userIOReadNeeded.
 	userIOReadNeeded.Store(true)
 
+	// The per-user I/O totals come from the shared /proc snapshot; whichever
+	// user_* collector is constructed first starts the walk that keeps it warm.
+	startUserProcRefresher()
+
 	readBytesDesc := prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, userIOInfoSubsystem, "read_bytes_total"),
 		"Total bytes read from disk by user processes.",

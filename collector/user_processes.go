@@ -52,6 +52,9 @@ func init() {
 
 // NewUserProcCollector returns a new Collector exposing user process and thread stats
 func NewUserProcCollector(logger *slog.Logger) (Collector, error) {
+	// The per-user counts come from the shared /proc snapshot; whichever
+	// user_* collector is constructed first starts the walk that keeps it warm.
+	startUserProcRefresher()
 	procDesc := prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, userProcSubsystem, "count"),
 		"Number of processes owned by user",

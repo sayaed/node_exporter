@@ -65,12 +65,15 @@ func TestUserMemPSSCollectionIsOptional(t *testing.T) {
 		collectPSS  bool
 		wantMetrics int
 	}{
-		{name: "disabled", collectPSS: false, wantMetrics: 1},
-		{name: "enabled", collectPSS: true, wantMetrics: 4},
+		// 1 RSS metric plus the five snapshot-health metrics. PSS enabled
+		// adds, per RSS user, one PSS and one unavailable-processes metric,
+		// then the PSS cache age and measurement duration: 6 + 4 = 10.
+		{name: "disabled", collectPSS: false, wantMetrics: 6},
+		{name: "enabled", collectPSS: true, wantMetrics: 10},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			collector := newUserMemCollector(slog.Default(), test.collectPSS)
-			metrics := make(chan prometheus.Metric, 4)
+			metrics := make(chan prometheus.Metric, 16)
 			if err := collector.Update(metrics); err != nil {
 				t.Fatalf("Update: %v", err)
 			}
@@ -103,11 +106,13 @@ func TestUserMemPSSIsAbsentBeforeFirstBackgroundRefresh(t *testing.T) {
 	})
 
 	collector := newUserMemCollector(slog.Default(), true)
-	metrics := make(chan prometheus.Metric, 4)
+	// One RSS metric plus the five snapshot-health metrics; the PSS snapshot
+	// is absent, so the PSS block emits nothing at all.
+	metrics := make(chan prometheus.Metric, 16)
 	if err := collector.Update(metrics); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-	if got := len(metrics); got != 1 {
-		t.Errorf("emitted %d metrics before the first PSS refresh, want only the RSS metric", got)
+	if got := len(metrics); got != 6 {
+		t.Errorf("emitted %d metrics before the first PSS refresh, want 6", got)
 	}
 }

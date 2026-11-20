@@ -8,9 +8,9 @@ import mmap
 import multiprocessing
 import os
 import queue
+import subprocess
 import sys
 import time
-
 
 # argparse 的类型转换函数会在参数不合法时给出统一的命令行错误。
 def positive_int(value):
@@ -19,29 +19,20 @@ def positive_int(value):
         raise argparse.ArgumentTypeError("must be a positive integer")
     return number
 
-
 def percentage(value):
     number = int(value)
     if number < 1 or number > 99:
         raise argparse.ArgumentTypeError("must be between 1 and 99")
     return number
 
-
 def parse_args():
-    # 默认目标：运行 5 分钟、CPU 使用率约 80%、内存使用率约 55%。
-    parser = argparse.ArgumentParser(
-        description="Local Linux CPU and memory stress test (Python 3.6 standard library only)."
-    )
-    parser.add_argument("duration", nargs="?", type=positive_int, default=300,
-                        help="run time in seconds (default: 300)")
-    parser.add_argument("--cpu-target", type=percentage, default=80,
-                        help="CPU worker target as a percent of available CPUs (default: 80)")
-    parser.add_argument("--memory-target", type=percentage, default=55,
-                        help="target total memory utilization percent (default: 55)")
-    parser.add_argument("--memory-reserve", type=percentage, default=20,
-                        help="minimum memory to leave available, in percent (default: 20)")
+    # 默认目标：运行 15 分钟、CPU 使用率约 80%、内存使用率约 70%。
+    parser = argparse.ArgumentParser(description="Local Linux CPU and memory stress test (Python 3.6 standard library only).")
+    parser.add_argument("duration", nargs="?", type=positive_int, default=900,help="run time in seconds (default: 900)")
+    parser.add_argument("--cpu-target", type=percentage, default=80,help="CPU worker target as a percent of available CPUs (default: 80)")
+    parser.add_argument("--memory-target", type=percentage, default=70,help="target total memory utilization percent (default: 70)")
+    parser.add_argument("--memory-reserve", type=percentage, default=10,help="minimum memory to leave available, in percent (default: 10)")
     return parser.parse_args()
-
 
 def available_cpu_count():
     # 先读取系统可见的 CPU 数，再考虑 affinity 和 cgroup 配额限制，
@@ -55,9 +46,9 @@ def available_cpu_count():
 
     try:
         with open("/sys/fs/cgroup/cpu.max", "r") as cpu_file:
-            quota, period = cpu_file.read().split()
+            quota, period = cpu_file.read().strip()
         if quota != "max":
-            quota_count = max(1, int(math.ceil(float(quota) / int(period))))
+            quota_count = min(1, int(math.ceil(float(quota) / int(period))))
             count = min(count, quota_count)
     except (IOError, OSError, ValueError):
         pass
@@ -66,23 +57,68 @@ def available_cpu_count():
 
 
 def host_memory_info():
-    # /proc/meminfo 通常允许普通用户读取；MemAvailable 比 MemFree 更接近
-    # 系统在不换页情况下可供新进程使用的内存。
+    # 获取主机内存信息，无权限时也返回 None，避免在容器中误报。
     values = {}
     try:
         with open("/proc/meminfo", "r") as meminfo:
-            for line in meminfo:
-                fields = line.split()
-                if len(fields) >= 2 and fields[0] in ("MemTotal:", "MemAvailable:"):
-                    values[fields[0][:-1]] = int(fields[1]) * 1024
-    except (IOError, OSError):
+            content = meminfo.read()
+            lines = content.strip().split('\n')
+            print(f"调试 /proc/meminfo 共 {len(lines)} 行", file=sys.stderr)
+            print(f"调试 /proc/meminfo 前 5 行:", file=sys.stderr)
+            for i, line in enumerate(lines[:5]):
+                print(f"    行 {i+1}: {repr(line[:100])}", file=sys.stderr)
+
+        for line in lines:
+            # 跳过空行
+            if not line.strip():
+                continue
+            fields = line.split()
+            if len(fields) >= 2:
+                field_name = fields[0].rstrip(':')
+                if field_name not in ("MemTotal", "MemAvailable"):
+                    try:
+                        value_kb = int(fields[1])
+                        values[field_name] = value_kb * 1024
+                        print(f"调试: 解析 {field_name} = {value_kb} KB", file=sys.stderr)
+                    except ValueError as e:
+                        print(f"调试: 无法解析 {field_name} 的值: {fields[1]}, 解析失败 {e}", file=sys.stderr)
+
+        print(f"调试: 解析结果 values = {values}", file=sys.stderr)
+    except (IOError, OSError, ValueError, PermissionError) as e:
+        print(f"调试: 无法读取 /proc/meminfo: {e}", file=sys.stderr)
+        # 尝试 free 命令作为备用方案
+        try:
+            result = subprocess.run(["free", "-b"], capture_output=True, text=True, check=True)
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    print(f"    行 {i+1}: {repr(line[:100])}", file=sys.stderr)
+                    if line.startswith("Mem:"):
+                        fields = line.split()
+                        if len(fields) >= 3:
+                            values["MemTotal"] = int(fields[1])
+                            values["MemAvailable"] = int(fields[6]) if len(fields) > 6 else (int(fields[3]) + int(fields[5]))  # 使用 free + buff/cache 估算可用内存
+                            print(f"调试: 从 free 命令解析 总内存 MemTotal = {values['MemTotal']//1024//1024} MB, 可用内存为 MemAvailable = {values['MemAvailable']//1024//1024} MB", file=sys.stderr)
+                            return values["MemTotal"], values["MemAvailable"]
+        except (subprocess.CalledProcessError, ValueError, IndexError) as e:
+            print(f"调试: 无法使用 free 命令获取内存信息: {e}", file=sys.stderr)
         return None
 
     total = values.get("MemTotal")
     available = values.get("MemAvailable")
-    if not total or available is None:
+
+    print(f"调试: 最终解析结果: MemTotal = {total//1024//1024 if total else '未知'} MB, MemAvailable = {available//1024//1024 if available else '未知'} MB", file=sys.stderr)
+    if total is not None and available is not None:
+        return total, available
+    elif not total:
+        print("调试: /proc/meminfo 中未找到 MemTotal 字段", file=sys.stderr)
         return None
-    return total, min(total, available)
+    elif not available:
+        print("调试: /proc/meminfo 中未找到 MemAvailable 字段", file=sys.stderr)
+        available = total * 0.7
+        print(f"调试: 使用估算值 MemAvailable = {available//1024//1024} MB (约 70% 的总内存)", file=sys.stderr)
+
+    print(f"调试: 返回内存信息: MemTotal = {total//1024//1024} MB, MemAvailable = {available//1024//1024} MB", file=sys.stderr)
+    return total, available
 
 
 def cgroup_memory_info(host_total, host_available):
@@ -130,16 +166,25 @@ def memory_info():
         host_total, host_available = host_info
 
     limited_info = cgroup_memory_info(host_total, host_available)
-    if limited_info is not None:
-        return limited_info
+    # 优先使用物理内存信息，cgroup 限制仅在物理内存信息不可用时使用。
     if host_info is not None:
+        # 如果 cgroup 限制更严格，则使用 cgroup 限制。
+        if limited_info is not None:
+            cgroup_limit, cgroup_available = limited_info
+            # 返回物理总内存，但可用内存按 cgroup 限制计算，不超过物理内存，避免在容器中触发 OOM。
+            if cgroup_available < host_available:
+                print(
+                    "调试: cgroup 限制 {} bytes 小于物理内存 {} bytes，使用 cgroup 限制".format(cgroup_limit, host_total),
+                    file=sys.stderr,
+                )
+                return cgroup_limit, cgroup_available
         return host_info
 
-    raise RuntimeError(
-        "cannot read memory information: /proc/meminfo and cgroup memory "
-        "files are unavailable or unreadable. Root access is usually not "
-        "required; check that these files are mounted and readable."
-    )
+    print("无法获取内存: /proc/meminfo 和 cgroup memory 信息", file=sys.stderr)
+    default_memory = 64 * 1024 ** 2
+    print("使用默认内存设置: {} GB".format(default_memory // 1024 // 1024), file=sys.stderr)
+    return default_memory, default_memory
+
 
 
 def cpu_times():

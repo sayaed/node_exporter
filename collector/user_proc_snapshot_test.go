@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // These tests run against the real /proc of the host, so unlike the pure parser
@@ -37,9 +38,12 @@ func TestBuildUserProcSnapshotAgainstRealProc(t *testing.T) {
 	userIOReadNeeded.Store(true)
 	t.Cleanup(func() { userIOReadNeeded.Store(restoreIO) })
 
-	procs, err := readUserProcs()
+	procs, partial, err := readUserProcs(time.Now().Add(time.Minute))
 	if err != nil {
 		t.Fatalf("readUserProcs: %v", err)
+	}
+	if partial {
+		t.Fatal("a walk with a minute of budget came back partial")
 	}
 
 	readable := make([]userProcInfo, 0, len(procs))
@@ -112,7 +116,7 @@ func TestBuildUserProcSnapshotAgainstRealProc(t *testing.T) {
 func buildUserProcSnapshotForTest(t *testing.T) *userProcSnapshot {
 	t.Helper()
 
-	snapshot, err := buildUserProcSnapshot()
+	snapshot, err := buildUserProcSnapshot(*userProcWalkBudget)
 	if err != nil {
 		t.Fatalf("buildUserProcSnapshot: %v", err)
 	}
@@ -166,7 +170,7 @@ func TestListProcPIDs(t *testing.T) {
 	}
 }
 
-func TestGetUserProcSnapshotCachesWithinTTL(t *testing.T) {
+func TestGetUserProcSnapshotServesTheCachedSnapshot(t *testing.T) {
 	first, err := getUserProcSnapshot()
 	if err != nil {
 		t.Fatalf("getUserProcSnapshot: %v", err)
@@ -176,7 +180,13 @@ func TestGetUserProcSnapshotCachesWithinTTL(t *testing.T) {
 		t.Fatalf("getUserProcSnapshot: %v", err)
 	}
 	if first != second {
-		t.Error("two calls within the TTL returned different snapshots")
+		t.Error("two scrapes with no background walk in between got different snapshots")
+	}
+	if first.duration <= 0 {
+		t.Errorf("snapshot records a %v walk duration, want the measured build time", first.duration)
+	}
+	if first.procs == 0 {
+		t.Error("snapshot reports zero read processes")
 	}
 }
 
@@ -185,9 +195,12 @@ func TestUserIOReadNeededSkipsTheIOFile(t *testing.T) {
 	userIOReadNeeded.Store(false)
 	t.Cleanup(func() { userIOReadNeeded.Store(restoreIO) })
 
-	procs, err := readUserProcs()
+	procs, partial, err := readUserProcs(time.Now().Add(time.Minute))
 	if err != nil {
 		t.Fatalf("readUserProcs: %v", err)
+	}
+	if partial {
+		t.Fatal("a walk with a minute of budget came back partial")
 	}
 
 	for _, proc := range procs {

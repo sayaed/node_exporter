@@ -73,6 +73,9 @@ type userCpuCollector struct {
 
 // NewUserCpuCollector returns a new Collector exposing per-user CPU time.
 func NewUserCpuCollector(logger *slog.Logger) (Collector, error) {
+	// The per-user CPU totals come from the shared /proc snapshot; whichever
+	// user_* collector is constructed first starts the walk that keeps it warm.
+	startUserProcRefresher()
 	userDesc := prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, usercpuInfoSubsystem, "process_cpu_seconds_total"),
 		"Total user and system CPU time spent in seconds by user processes.",
